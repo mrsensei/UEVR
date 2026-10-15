@@ -6819,9 +6819,87 @@ void VRRenderTargetManager_Base::pre_texture_hook_callback(safetyhook::Context& 
     } else {
         SPDLOG_INFO("Calling E8 version of texture create");
         
-        // check if RCX is near the stack pointer
-        // if it is then it's a different form of E8 call that takes the texture in the first parameter.
-        if (ctx.rcx != 0 && std::abs((int64_t)ctx.rcx - (int64_t)ctx.rsp) <= 0x300) {
+        if (rtm->is_using_texture_initializer) {
+            // UE 5.6+: RHICmdList.CreateTextureInitializer(&Initializer, Desc), Initializer.Finalize(&Out), ~Initializer()
+            SPDLOG_INFO("Calling UE 5.6+ texture initializer version of texture create");
+
+            void (*create)(
+                uintptr_t command_list,
+                void* initializer,
+                uintptr_t desc
+            ) = (decltype(create))func_ptr;
+
+            void (*finalize)(
+                void* initializer,
+                FTexture2DRHIRef* out
+            ) = (decltype(finalize))rtm->texture_initializer_finalize_fn;
+
+            void (*destroy)(
+                void* initializer
+            ) = (decltype(destroy))rtm->texture_initializer_destructor_fn;
+
+            if (ctx.r8 == 0 || IsBadReadPtr((void*)ctx.r8, 0x100 + sizeof(int32_t) * 2) || finalize == nullptr || destroy == nullptr) {
+                SPDLOG_ERROR("UE 5.6+ texture initializer: bad desc or missing functions, not creating UI texture!");
+                return;
+            }
+
+            // Scan for the render target width and height in the desc
+            // and replace it with the desktop resolution (This is for the UI texture)
+            const auto scan_x = VR::get()->get_hmd_width() * 2;
+            const auto scan_y = VR::get()->get_hmd_height();
+
+            std::optional<int32_t> width_offset{};
+            std::optional<int32_t> height_offset{};
+
+            int32_t old_width{};
+            int32_t old_height{};
+
+            for (auto i = 0; i < 0x100; ++i) {
+                auto& x = *(int32_t*)(ctx.r8 + i);
+                auto& y = *(int32_t*)(ctx.r8 + i + 4);
+
+                if (x == scan_x && y == scan_y) {
+                    SPDLOG_INFO("UE5: Found render target width and height at offset: {:x}", i);
+
+                    width_offset = i;
+                    height_offset = i + 4;
+
+                    old_width = x;
+                    old_height = y;
+
+                    x = size.x;
+                    y = size.y;
+
+                    uint8_t* format = (uint8_t*)(ctx.r8 + width_offset.value() + 15);
+
+                    // some games have 10 bit format
+                    if (*format == 18) {
+                        *format = 2; // PF_B8G8R8A8
+                    }
+
+                    break;
+                }
+            }
+
+            // Comfortably larger than FRHITextureInitializer, which lives in a stack slot of the caller
+            alignas(16) std::array<uint8_t, 0x400> initializer{};
+
+            create(ctx.rcx, initializer.data(), ctx.r8);
+            finalize(initializer.data(), &out);
+            destroy(initializer.data());
+
+            if (width_offset && height_offset) {
+                auto& x = *(int32_t*)(ctx.r8 + *width_offset);
+                auto& y = *(int32_t*)(ctx.r8 + *height_offset);
+
+                x = old_width;
+                y = old_height;
+            }
+
+            // texture_hook_ref is set in the post texture hook (after finalize), the game's out ref isn't known here.
+        } else if (ctx.rcx != 0 && std::abs((int64_t)ctx.rcx - (int64_t)ctx.rsp) <= 0x300) {
+            // check if RCX is near the stack pointer
+            // if it is then it's a different form of E8 call that takes the texture in the first parameter.
             SPDLOG_INFO("Weird form of E8 call detected...");
 
             // RDX check is to make sure RDX is a pointer and not something like the width which would be a relatively small integer
@@ -7031,6 +7109,17 @@ void VRRenderTargetManager_Base::texture_hook_callback(safetyhook::Context& ctx,
     }
 
     rtm->allocate_texture_called = false;
+
+    // UE 5.6+: this hook is placed right after Initializer.Finalize(&OutRef), which returns FTextureRHIRef by value.
+    // The hidden return pointer (finalize's RDX) comes back in RAX, and that's where the new texture is.
+    // The engine only moves it into the viewport's member afterwards, so the ref from AllocateRenderTargetTexture is still stale here.
+    if (rtm->is_using_texture_initializer) {
+        if (ctx.rax != 0 && !IsBadReadPtr((void*)ctx.rax, sizeof(void*))) {
+            rtm->texture_hook_ref = (FTexture2DRHIRef*)ctx.rax;
+        } else {
+            SPDLOG_ERROR(" [UE 5.6+] RAX after finalize is bad! Can't get texture!");
+        }
+    }
 
     // very rare...
     if (rtm->is_using_texture_desc && !rtm->is_version_greq_5_1) {
@@ -7811,6 +7900,104 @@ bool VRRenderTargetManager_Base::allocate_render_target_texture(uintptr_t return
             "F6 85 ? ? ? ? 05", // test byte ptr [rbp+?], 5 (seen in UE5 debug/dev builds)
         };
 
+        // UE 5.6+/5.7: after the FRHITextureDesc copy, the texture is created through an initializer object:
+        // RHICmdList.CreateTextureInitializer(&Initializer, Desc) -> Initializer.Finalize(&OutRef) -> ~Initializer()
+        // call create
+        // mov rcx, <initializer> / lea rdx, [<out ref>] (either order)
+        // call finalize
+        // mov rcx, <initializer> (same encoding as above)
+        // call destructor
+        bool skipped_ue57_texture_desc_copy = false;
+
+        struct TextureInitializerSequence {
+            uintptr_t finalize_call{};
+            uintptr_t finalize_fn{};
+            uintptr_t destructor_fn{};
+        };
+
+        auto match_texture_initializer_sequence = [](uintptr_t create_call) -> std::optional<TextureInitializerSequence> {
+            auto writes_reg = [](const INSTRUX& ix, ND_UINT32 reg) {
+                const auto mnemonic = std::string_view{ix.Mnemonic};
+
+                return (mnemonic == "MOV" || mnemonic == "LEA") &&
+                    ix.Operands[0].Type == ND_OP_REG && ix.Operands[0].Info.Register.Type == ND_REG_GPR &&
+                    ix.Operands[0].Info.Register.Size == 8 && ix.Operands[0].Info.Register.Reg == reg;
+            };
+
+            auto ip = create_call + 5;
+            std::vector<uint8_t> initializer_load{};
+            bool rdx_set = false;
+
+            for (auto i = 0; i < 2; ++i) {
+                const auto ix = utility::decode_one((uint8_t*)ip);
+
+                if (!ix) {
+                    return std::nullopt;
+                }
+
+                if (writes_reg(*ix, NDR_RCX) && initializer_load.empty()) {
+                    initializer_load.assign((uint8_t*)ip, (uint8_t*)ip + ix->Length);
+                } else if (writes_reg(*ix, NDR_RDX) && !rdx_set) {
+                    rdx_set = true;
+                } else {
+                    return std::nullopt;
+                }
+
+                ip += ix->Length;
+            }
+
+            if (*(uint8_t*)ip != 0xE8) {
+                return std::nullopt;
+            }
+
+            TextureInitializerSequence result{};
+            result.finalize_call = ip;
+            result.finalize_fn = utility::calculate_absolute(ip + 1);
+            ip += 5;
+
+            // The initializer must be passed to the destructor exactly the same way it was passed to finalize
+            if (memcmp((void*)ip, initializer_load.data(), initializer_load.size()) != 0) {
+                return std::nullopt;
+            }
+
+            ip += initializer_load.size();
+
+            if (*(uint8_t*)ip != 0xE8) {
+                return std::nullopt;
+            }
+
+            result.destructor_fn = utility::calculate_absolute(ip + 1);
+
+            return result;
+        };
+
+        // Linearly scans forward a short distance for the create call of the sequence above.
+        auto find_texture_initializer_sequence = [&](uintptr_t start) -> std::optional<uintptr_t> {
+            auto ip = start;
+
+            for (auto i = 0; i < 30; ++i) {
+                const auto ix = utility::decode_one((uint8_t*)ip);
+
+                if (!ix) {
+                    return std::nullopt;
+                }
+
+                const auto mnemonic = std::string_view{ix->Mnemonic};
+
+                if (mnemonic.starts_with("RET") || mnemonic.starts_with("JMP") || mnemonic.starts_with("INT3")) {
+                    return std::nullopt;
+                }
+
+                if (*(uint8_t*)ip == 0xE8 && match_texture_initializer_sequence(ip).has_value()) {
+                    return ip;
+                }
+
+                ip += ix->Length;
+            }
+
+            return std::nullopt;
+        };
+
         while(true) {
             if (emu.ctx->InstructionsCount > 200) {
                 SPDLOG_WARN("Emulated too many instructions without finding the call, aborting!");
@@ -7875,8 +8062,14 @@ bool VRRenderTargetManager_Base::allocate_render_target_texture(uintptr_t return
                             const auto module_fn_within = utility::get_module_within(fn);
                             const auto next_insn = (uint8_t*)(ip + decoded->Length);
 
-                            // Seen on UE5.3.2 development builds
-                            if (auto result = utility::scan_disasm(fn, 15, "BD 01 00 00 00"); result.has_value()) {
+                            if (skipped_ue57_texture_desc_copy) {
+                                // After the desc copy, only accept the create -> finalize -> destructor sequence.
+                                // Anything in between (e.g. freeing the temporary desc's arrays) is not the right one.
+                                if (!match_texture_initializer_sequence(ip).has_value()) {
+                                    SPDLOG_INFO("Call at {:x} is not a texture initializer create sequence, skipping this call!", ip);
+                                    next_call_is_not_the_right_one = true;
+                                }
+                            } else if (auto result = utility::scan_disasm(fn, 15, "BD 01 00 00 00"); result.has_value()) { // Seen on UE5.3.2 development builds
                                 // This string is not unicode
                                 if (utility::find_string_reference_in_path(fn, "InGPUMask != 0", false).has_value()) {
                                     SPDLOG_INFO("Found InGPUMask != 0 string within the function and mov ebp, 1, skipping this call!");
@@ -7892,6 +8085,16 @@ bool VRRenderTargetManager_Base::allocate_render_target_texture(uintptr_t return
                             } else if (utility::find_pattern_in_path((uint8_t*)fn, 30, true, "66 41 C7 40 34 00 FF")) {
                                 SPDLOG_INFO("Found 66 41 C7 40 34 00 FF pattern within the function, skipping this call!");
                                 next_call_is_not_the_right_one = true;
+                            } else if (utility::find_pattern_in_path((uint8_t*)fn, 40, false, "C6 ? 35 FF") &&
+                                       utility::find_pattern_in_path((uint8_t*)fn, 40, false, "88 ? 34") &&
+                                       find_texture_initializer_sequence((uintptr_t)next_insn).has_value())
+                            {
+                                // Same FRHITextureDesc initialization as above, but emitted as two byte stores (seen on UE 5.7)
+                                // mov byte ptr [reg+34h], al / mov byte ptr [reg+35h], 0FFh, ~32 instructions in
+                                // Only done when the create -> finalize -> destructor sequence follows, so older versions are unaffected.
+                                SPDLOG_INFO("Found C6 ? 35 FF and 88 ? 34 pattern within the function (FRHITextureDesc copy), skipping this call!");
+                                next_call_is_not_the_right_one = true;
+                                skipped_ue57_texture_desc_copy = true;
                             } else {
                                 // Check how many instructions are in the call. If there's <= 30 AND there's no call/jmp in it, this is not the right one
                                 size_t insn_count = 0;
@@ -7902,10 +8105,13 @@ bool VRRenderTargetManager_Base::allocate_render_target_texture(uintptr_t return
                                         return utility::ExhaustionResult::BREAK;
                                     }
 
+                                    ++insn_count;
                                     return utility::ExhaustionResult::CONTINUE;
                                 });
 
-                                if (insn_count <= 30 && !encountered_branch) {
+                                // insn_count is only logged. It was never incremented before, so this check has always
+                                // been "no calls/branches" alone; enforcing <= 30 now could change which call gets picked in games that work today.
+                                if (!encountered_branch) {
                                     SPDLOG_INFO("Function at {:x} only has {} instructions and no calls/branches, skipping this call!", fn, insn_count);
                                     next_call_is_not_the_right_one = true;
                                 }
@@ -7922,7 +8128,20 @@ bool VRRenderTargetManager_Base::allocate_render_target_texture(uintptr_t return
                     }
 
                     if (is_call && !next_call_is_not_the_right_one) {
-                        const auto post_call = (uintptr_t)ip + decoded->Length;
+                        auto post_call = (uintptr_t)ip + decoded->Length;
+
+                        if (skipped_ue57_texture_desc_copy && bytes[0] == 0xE8) {
+                            if (const auto sequence = match_texture_initializer_sequence(ip); sequence.has_value()) {
+                                // The texture only exists after finalize, so the post hook goes there instead.
+                                this->is_using_texture_initializer = true;
+                                this->texture_initializer_finalize_fn = sequence->finalize_fn;
+                                this->texture_initializer_destructor_fn = sequence->destructor_fn;
+                                post_call = sequence->finalize_call + 5;
+
+                                SPDLOG_INFO("UE 5.6+ texture initializer sequence found! Finalize: {:x}, Destructor: {:x}", sequence->finalize_fn, sequence->destructor_fn);
+                            }
+                        }
+
                         SPDLOG_INFO("AllocateRenderTargetTexture post_call: {:x}, rel {:x}", post_call, post_call - (uintptr_t)*utility::get_module_within((void*)post_call));
 
                         if (*(uint8_t*)ip == 0xE8) {

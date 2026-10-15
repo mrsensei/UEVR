@@ -151,6 +151,9 @@ protected:
     bool is_version_5_0_3{false};
     bool wants_depth_reallocate{false};
     bool allocate_texture_called{false}; // used to determine if the pretexture hook should go ahead
+    bool is_using_texture_initializer{false}; // UE 5.6+/5.7: create -> finalize -> destructor instead of a single create call
+    uintptr_t texture_initializer_finalize_fn{0};
+    uintptr_t texture_initializer_destructor_fn{0};
 
     uint32_t last_width{0};
     uint32_t last_height{0};
